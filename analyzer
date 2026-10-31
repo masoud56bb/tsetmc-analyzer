@@ -1,0 +1,120 @@
+# analyzer.py
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# یک لیست نمونه از InsCode نمادهای بورس تهران.
+# برای لیست کامل، باید از endpoint جستجوی TSETMC استفاده کنید.
+SAMPLE_INSCODES = {
+    "فملی": "35425587644337450",
+    "فولاد": "46348559193224090",
+    "شپنا": "7745894403636165",
+    "خودرو": "65883838195688438",
+    "وبملت": "778253364357513",
+    "کگل": "35700344742885862",
+    "تاپیکو": "36660424146137630",
+    "پترول": "22946256124040775",
+    "وغدیر": "4793880173915055",
+    "شفن": "2524415071401338",
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+}
+
+def _fetch_daily_history(ins_code: str, top: int = 200) -> pd.DataFrame:
+    """دریافت تاریخچه قیمت روزانه از TSETMC (cdn subdomain)."""
+    url = (
+        f"https://cdn.tsetmc.com/api/ClosingPrice/"
+        f"GetClosingPriceDailyList/{ins_code}/{top}"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data.get("closingPriceDaily", [])
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        # ستونهای کلیدی: priceMin, priceMax, priceFirst, priceLast, qTotTran5J
+        # برای سادگی از priceLast بهعنوان Close استفاده میکنیم.
+        df["Close"] = pd.to_numeric(df["priceLast"], errors="coerce")
+        df["High"] = pd.to_numeric(df["priceMax"], errors="coerce")
+        df["Low"] = pd.to_numeric(df["priceMin"], errors="coerce")
+        df["Open"] = pd.to_numeric(df["priceFirst"], errors="coerce")
+        df["Volume"] = pd.to_numeric(df["qTotTran5J"], errors="coerce")
+        df = df.dropna(subset=["Close"]).reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"Error fetching {ins_code}: {e}")
+        return pd.DataFrame()
+
+def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """محاسبه اندیکاتورهای RSI(14), SMA(50), MACD(12,26,9)."""
+    if df.empty or len(df) < 50:
+        return df
+
+    # RSI
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["RSI14"] = 100 - (100 / (1 + rs))
+
+    # SMA 50
+    df["SMA50"] = df["Close"].rolling(50).mean()
+
+    # MACD
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+
+    return df
+
+def get_top_value_stocks(top_n: int = 10) -> pd.DataFrame:
+    """
+    غربالگری نمادها بر اساس شرایط تکنیکال و بازگرداندن top_n سهم برتر.
+    شرایط نمونه:
+        - RSI14 < 30 (اشباع فروش)
+        - قیمت بالای SMA50
+        - MACD > 0
+    امتیازدهی: RSI پایینتر + هیستوگرام MACD بالاتر = امتیاز بهتر.
+    """
+    results = []
+
+    for symbol, ins_code in SAMPLE_INSCODES.items():
+        df = _fetch_daily_history(ins_code)
+        if df.empty:
+            continue
+        df = _calculate_indicators(df)
+        if df.empty or len(df) < 50:
+            continue
+
+        latest = df.iloc[-1]
+        if pd.isna(latest["RSI14"]) or pd.isna(latest["SMA50"]) or pd.isna(latest["MACD"]):
+            continue
+
+        # شرایط غربالگری
+        if latest["RSI14"] < 30 and latest["Close"] > latest["SMA50"] and latest["MACD"] > 0:
+            score = (30 - latest["RSI14"]) + latest["MACD_Hist"] * 100
+            results.append({
+                "symbol": symbol,
+                "close": round(latest["Close"], 2),
+                "RSI14": round(latest["RSI14"], 2),
+                "SMA50": round(latest["SMA50"], 2),
+                "MACD": round(latest["MACD"], 4),
+                "score": round(score, 4),
+            })
+
+    if not results:
+        return pd.DataFrame()
+
+    result_df = pd.DataFrame(results).sort_values("score", ascending=False)
+    return result_df.head(top_n).reset_index(drop=True)
